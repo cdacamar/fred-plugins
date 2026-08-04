@@ -1,3 +1,6 @@
+#define true 1
+#define false 0
+
 typedef enum VimState {
   VIM_STATE_Command,
   VIM_STATE_Default = VIM_STATE_Command,
@@ -17,6 +20,14 @@ typedef enum VimSubCommand {
   VIM_SUBCMD_z    = 'z',
   VIM_SUBCMD_dg   = '@',
   VIM_SUBCMD_ci   = '`',
+  VIM_SUBCMD_f    = 'f',
+  VIM_SUBCMD_F    = 'F',
+  VIM_SUBCMD_t    = 't',
+  VIM_SUBCMD_T    = 'T',
+  VIM_SUBCMD_df   = 240,
+  VIM_SUBCMD_yf   = 241,
+  VIM_SUBCMD_dt   = 242, 
+  VIM_SUBCMD_yt   = 243, 
 } VimSubCommand;
 
 typedef struct VimProcessorState {
@@ -158,6 +169,57 @@ int current_cursor_offset(Arena* a, EditorCtx* ctx, uint64_t* out_offset) {
   return 1;
 }
 
+//Compare search_string with the character at a given position in the buffer
+uint64_t compare_char(Arena *arena, EditorCtx *ctx, uint64_t pos, String8 search_string) {
+  EditorOffsetRange current_range = {0};
+  current_range.first_off = pos;
+  current_range.last_off = pos + 1;
+  String8 curr_char = {0};
+  ed_string_at_range(arena, ctx, &current_range, &curr_char);
+  return str8_compare(curr_char, search_string);
+}
+
+//Move num_cursors amount of cursors to given pos; number of positions should equal num_cursors
+void move_to(Arena *arena, VimCmdBufferList *cmd_lst, EditorCmd *cmd, uint64_t *pos, uint64_t num_cursors) {
+  
+  cmd->cmd = ED_NavMoveCursorTo;
+  cmd->byte_offsets.array = pos;
+  cmd->byte_offsets.size = num_cursors;
+  push_vim_cmd_entry(arena, cmd_lst, cmd);
+}
+
+//Add Update selection flag and then call move_to
+void move_to_selection(Arena *arena, VimCmdBufferList *cmd_lst, EditorCmd *cmd, uint64_t *pos, uint64_t num_cursors) {
+  cmd->flags = ED_FLG_UpdateSelection;
+  move_to(arena, cmd_lst, cmd, pos, num_cursors);
+}
+
+//Given a cursor offset search for search_string on that line, search_forward == true check right else check left
+uint64_t search_in_line(Arena *arena, EditorCtx *ctx, uint64_t cursor_offset, String8 search_string, int search_forward) {
+    uint64_t current_line = ed_line_at_offset(ctx, cursor_offset);
+    uint64_t move_to_byte = cursor_offset;
+    
+    EditorOffsetRange offset_range = {0};
+    ed_byte_range_at_line(ctx, current_line, &offset_range);
+    
+    uint64_t direction = search_forward ? 1 : -1;
+    uint64_t start = search_forward ? cursor_offset + 1 : cursor_offset - 1;
+    uint64_t end =  search_forward ? offset_range.last_off : offset_range.first_off;
+  
+    for (;;) {
+      if (compare_char(arena, ctx, start, search_string) == 0) {
+        move_to_byte = start;
+        break;
+      }
+      int should_continue = search_forward ? start <= end : start >= end;
+      if (!should_continue) {
+        break;
+      }
+      start = start + direction;
+    }
+    return move_to_byte;
+}
+
 void vim_visual_line_mode_update_selection(EditorCtx* ctx, VimProcessorState* vim_state) {
   uint64_t current_offset = 0;
   int64_t origin_line = 0;
@@ -206,260 +268,346 @@ void vim_process_vis(EditorCtx* ctx, VimProcessorState* vim_state, char c) {
   VimSubCommand prev_sub_cmd = vim_state->sub_cmd;
   cmd.flags |= ED_FLG_UpdateSelection;
   vim_state->sub_cmd = VIM_SUBCMD_None;
-
-  // Command processing.
-  switch (c) {
-  // Capture repeats.
-  case '1':
-  case '2':
-  case '3':
-  case '4':
-  case '5':
-  case '6':
-  case '7':
-  case '8':
-  case '9':
-    vim_state->repeat *= 10;
-    vim_state->repeat += (c - '0');
-    // Preserve whatever command we were processing.
-    vim_state->sub_cmd = prev_sub_cmd;
-    captured_repeat = 1;
-    break;
-  // Movement.
-  case 'h':
-    if (vim_state->visual_line_mode)
+  
+  //fx and tx properties
+  EditorCursorArray cursors = {0};
+  String8 search_string = str8(&c, 1);
+  uint64_t pos_offset = 0;
+  switch (prev_sub_cmd) {
+  case VIM_SUBCMD_t:
+    pos_offset = -1;
+  case VIM_SUBCMD_f:
     {
+      ed_cursor_ranges(scratch.arena, ctx, &cursors);
+      uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+      
+      for EachIndex(i, cursors.size) {
+        cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, 1) + pos_offset;
+      }
+      move_to(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size);
+    }
+    break; 
+  case VIM_SUBCMD_T:
+    pos_offset = 1;
+  case VIM_SUBCMD_F:
+    {
+      ed_cursor_ranges(scratch.arena, ctx, &cursors);
+      uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+      
+      for EachIndex(i, cursors.size) {
+        cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, 0) + pos_offset;
+      }
+      move_to(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size);
+    }
+    break;
+  case VIM_SUBCMD_df:
+    pos_offset = 1;
+  case VIM_SUBCMD_dt: 
+    {
+      ed_cursor_ranges(scratch.arena, ctx, &cursors);
+      uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+      
+      for EachIndex(i, cursors.size) {
+        cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, 1) + pos_offset;
+      }
+      move_to_selection(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size); 
+      cmd.cmd = ED_RequestClipboardCut;
+      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
       break;
     }
-    cmd.cmd = ED_NavLeft;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'j':
-    cmd.cmd = ED_NavLineDown;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'k':
-    cmd.cmd = ED_NavLineUp;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'l':
-    if (vim_state->visual_line_mode) {
-      break;
-    }
-    cmd.cmd = ED_NavRight;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'H':
+  case VIM_SUBCMD_yf:
+    pos_offset = 1;
+  case VIM_SUBCMD_yt:
     {
-      // Make the camera recenter.
-      cmd.flags |= ED_FLG_ResetCamera;
-      cmd.cmd = ED_NavCursorTopScreen;
+      ed_cursor_ranges(scratch.arena, ctx, &cursors);
+      uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+      
+      //Gather initial cursor positions to return to
+      EditorCursorArray cursors_base = {0};
+      ed_cursor_ranges(scratch.arena, ctx, &cursors_base);
+      uint64_t* cursor_base_positions = push_array_no_zero(scratch.arena, uint64_t, cursors_base.size);
+      for EachIndex(i, cursors_base.size) {
+        cursor_base_positions[i] = cursors_base.array[i].cursor_off;
+      }
+      
+      for EachIndex(i, cursors.size) {
+        cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, 1) + pos_offset;
+      }
+      
+      move_to_selection(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size); 
+      cmd.cmd = ED_RequestClipboardCopy;
       push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+      move_to(scratch.arena, &cmd_lst, &cmd, cursor_base_positions, cursors.size); 
     }
     break;
-  case 'L':
-    {
-      // Make the camera recenter.
-      cmd.flags |= ED_FLG_ResetCamera;
-      cmd.cmd = ED_NavCursorBottomScreen;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    }
-    break;
-  case 'M':
-    {
-      // Make the camera recenter.
-      cmd.flags |= ED_FLG_ResetCamera;
-      cmd.cmd = ED_NavCursorCenterScreen;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    }
-    break;
-  case '0':
-    if (vim_state->repeat != 0)
-    {
-      vim_state->repeat *= 10;
-      // Preserve whatever command we were processing.
-      vim_state->sub_cmd = prev_sub_cmd;
-      captured_repeat = 1;
-    }
-    else
-    {
-      cmd.cmd = ED_NavBeginningOfLine;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    }
-    break;
-  case '^':
-    cmd.cmd = ED_NavFirstNonemptyOfLine;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case '_':
-    if (vim_state->repeat > 0)
-    {
-      vim_state->repeat -= 1;
-      cmd.cmd = ED_NavLineDown;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      captured_repeat = 1;
-    }
+  default:
+    // Command processing.
+    switch (c) {
+      // Capture repeats.
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+      case '6':
+      case '7':
+      case '8':
+      case '9':
+        vim_state->repeat *= 10;
+        vim_state->repeat += (c - '0');
+        // Preserve whatever command we were processing.
+        vim_state->sub_cmd = prev_sub_cmd;
+        captured_repeat = 1;
+        break;
+        // Movement.
+      case 'h':
+        if (vim_state->visual_line_mode)
+        {
+          break;
+        }
+        cmd.cmd = ED_NavLeft;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'j':
+        cmd.cmd = ED_NavLineDown;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'k':
+        cmd.cmd = ED_NavLineUp;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'l':
+        if (vim_state->visual_line_mode) {
+          break;
+        }
+        cmd.cmd = ED_NavRight;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'H':
+        {
+          // Make the camera recenter.
+          cmd.flags |= ED_FLG_ResetCamera;
+          cmd.cmd = ED_NavCursorTopScreen;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        }
+        break;
+      case 'L':
+        {
+          // Make the camera recenter.
+          cmd.flags |= ED_FLG_ResetCamera;
+          cmd.cmd = ED_NavCursorBottomScreen;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        }
+        break;
+      case 'M':
+        {
+          // Make the camera recenter.
+          cmd.flags |= ED_FLG_ResetCamera;
+          cmd.cmd = ED_NavCursorCenterScreen;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        }
+        break;
+      case '0':
+        if (vim_state->repeat != 0)
+        {
+          vim_state->repeat *= 10;
+          // Preserve whatever command we were processing.
+          vim_state->sub_cmd = prev_sub_cmd;
+          captured_repeat = 1;
+        }
+        else
+        {
+          cmd.cmd = ED_NavBeginningOfLine;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        }
+        break;
+      case '^':
+        cmd.cmd = ED_NavFirstNonemptyOfLine;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case '_':
+        if (vim_state->repeat > 0)
+        {
+          vim_state->repeat -= 1;
+          cmd.cmd = ED_NavLineDown;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          captured_repeat = 1;
+        }
 
-    cmd.cmd = ED_NavFirstNonemptyOfLine;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case '$':
-    cmd.cmd = ED_NavEndOfLine;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'G':
-    cmd.cmd = ED_NavContentEnd;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'g':
-    if (prev_sub_cmd == VIM_SUBCMD_g)
-    {
-      cmd.cmd = ED_NavContentBeginning;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        cmd.cmd = ED_NavFirstNonemptyOfLine;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case '$':
+        cmd.cmd = ED_NavEndOfLine;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'G':
+        cmd.cmd = ED_NavContentEnd;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'g':
+        if (prev_sub_cmd == VIM_SUBCMD_g)
+        {
+          cmd.cmd = ED_NavContentBeginning;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        }
+        else
+        {
+          vim_state->sub_cmd = VIM_SUBCMD_g;
+        }
+        break;
+      case '%':
+        cmd.cmd = ED_NavMatchingEncloser;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'e': // FIXME: find correct behavior for 'e'.
+      case 'w':
+        cmd.cmd = ED_NavWordRight;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'E': // FIXME: find correct behavior for 'E'.
+      case 'W':
+        cmd.cmd = ED_NavChunkRight;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'b':
+        cmd.cmd = ED_NavWordLeft;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'B':
+        cmd.cmd = ED_NavChunkLeft;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case '}':
+        cmd.cmd = ED_NavEmptyBlockDown;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case '{':
+        cmd.cmd = ED_NavEmptyBlockUp;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+        // Insertion-like behavior.
+      case 'i':
+        vim_change_state(vim_state, VIM_STATE_Insert);
+        break;
+      case 'o':
+        vim_change_state(vim_state, VIM_STATE_Insert);
+        cmd.cmd = ED_InsOpenLineBelow;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'O':
+        vim_change_state(vim_state, VIM_STATE_Insert);
+        cmd.cmd = ED_InsOpenLineAbove;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'R':
+        vim_change_state(vim_state, VIM_STATE_Replace);
+        break;
+        // Editing shortcuts.
+      case 'u': // Redo will share the original shortcut.
+        vim_change_state(vim_state, VIM_STATE_Default);
+        cmd.cmd = ED_URTryUndo;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'd':
+        vim_change_state(vim_state, VIM_STATE_Default);
+        cmd.cmd = ED_DelDeleteChar;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'x':
+        vim_change_state(vim_state, VIM_STATE_Default);
+        cmd.cmd = ED_RequestClipboardCut;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'c':
+        cmd.cmd = ED_DelDeleteChar;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        // Pull into insert.
+        vim_change_state(vim_state, VIM_STATE_Insert);
+        break;
+      case 'C':
+        // The interaction here is to delete the selection and then delete the resulting
+        // line contents.
+        // Note: We want to make this 'chunky', so let's suppress history until the last
+        // removal.
+        cmd.cmd = ED_DelDeleteChar;
+        cmd.flags = ED_FLG_SuppressHistory;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        // Remove the selection update so we can select the remainder of the line.
+        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+        cmd.cmd = ED_NavBeginningOfLine;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        cmd.cmd = ED_NavEndOfLine;
+        cmd.flags |= ED_FLG_UpdateSelection;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        // Now delete it.
+        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+        // Enable history again.
+        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_SuppressHistory);
+        cmd.cmd = ED_DelDeleteChar;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        // Pull into insert.
+        vim_change_state(vim_state, VIM_STATE_Insert);
+        break;
+        // Search.
+      case '/':
+        cmd.cmd = ED_FindRequestFind;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case '*':
+        cmd.cmd = ED_FindRequestFindWithSeed;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+        // Yank/Paste.
+      case 'y':
+        vim_change_state(vim_state, VIM_STATE_Default);
+        cmd.cmd = ED_RequestClipboardCopy;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        // Also, clear the selections.
+        cmd.cmd = ED_SelectionClearSelections;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'p':
+        vim_change_state(vim_state, VIM_STATE_Default);
+        cmd.cmd = ED_RequestClipboardPaste;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+      case 'P':
+        vim_change_state(vim_state, VIM_STATE_Default);
+        cmd.cmd = ED_RequestClipboardPasteBeforeCursor;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        break;
+        // Visual mode engage!
+      case 'v':
+        vim_change_state(vim_state, VIM_STATE_Visual);
+        break;
+      case 'V':
+        vim_state->visual_line_mode = 1;
+        break;
+      case 'z':
+        if (prev_sub_cmd == VIM_SUBCMD_z) {
+          cmd.cmd = ED_NavCenterCameraCursor;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        } else {
+          vim_state->sub_cmd = VIM_SUBCMD_z;
+        }
+        break;
+      case 'f':
+        vim_state->sub_cmd = VIM_SUBCMD_f;
+        break;
+      case 'F':
+        vim_state->sub_cmd = VIM_SUBCMD_F;
+        break;
+      case 't':
+        vim_state->sub_cmd = VIM_SUBCMD_t;
+        break;
+      case 'T':
+        vim_state->sub_cmd = VIM_SUBCMD_T;
+        break;
     }
-    else
-    {
-      vim_state->sub_cmd = VIM_SUBCMD_g;
-    }
     break;
-  case '%':
-    cmd.cmd = ED_NavMatchingEncloser;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'e': // FIXME: find correct behavior for 'e'.
-  case 'w':
-    cmd.cmd = ED_NavWordRight;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'E': // FIXME: find correct behavior for 'E'.
-  case 'W':
-    cmd.cmd = ED_NavChunkRight;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'b':
-    cmd.cmd = ED_NavWordLeft;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'B':
-    cmd.cmd = ED_NavChunkLeft;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case '}':
-    cmd.cmd = ED_NavEmptyBlockDown;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case '{':
-    cmd.cmd = ED_NavEmptyBlockUp;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  // Insertion-like behavior.
-  case 'i':
-    vim_change_state(vim_state, VIM_STATE_Insert);
-    break;
-  case 'o':
-    vim_change_state(vim_state, VIM_STATE_Insert);
-    cmd.cmd = ED_InsOpenLineBelow;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'O':
-    vim_change_state(vim_state, VIM_STATE_Insert);
-    cmd.cmd = ED_InsOpenLineAbove;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'R':
-    vim_change_state(vim_state, VIM_STATE_Replace);
-    break;
-  // Editing shortcuts.
-  case 'u': // Redo will share the original shortcut.
-    vim_change_state(vim_state, VIM_STATE_Default);
-    cmd.cmd = ED_URTryUndo;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'd':
-    vim_change_state(vim_state, VIM_STATE_Default);
-    cmd.cmd = ED_DelDeleteChar;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'x':
-    vim_change_state(vim_state, VIM_STATE_Default);
-    cmd.cmd = ED_RequestClipboardCut;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'c':
-    cmd.cmd = ED_DelDeleteChar;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    // Pull into insert.
-    vim_change_state(vim_state, VIM_STATE_Insert);
-    break;
-  case 'C':
-    // The interaction here is to delete the selection and then delete the resulting
-    // line contents.
-    // Note: We want to make this 'chunky', so let's suppress history until the last
-    // removal.
-    cmd.cmd = ED_DelDeleteChar;
-    cmd.flags = ED_FLG_SuppressHistory;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    // Remove the selection update so we can select the remainder of the line.
-    cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-    cmd.cmd = ED_NavBeginningOfLine;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    cmd.cmd = ED_NavEndOfLine;
-    cmd.flags |= ED_FLG_UpdateSelection;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    // Now delete it.
-    cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-    // Enable history again.
-    cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_SuppressHistory);
-    cmd.cmd = ED_DelDeleteChar;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    // Pull into insert.
-    vim_change_state(vim_state, VIM_STATE_Insert);
-    break;
-  // Search.
-  case '/':
-    cmd.cmd = ED_FindRequestFind;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case '*':
-    cmd.cmd = ED_FindRequestFindWithSeed;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  // Yank/Paste.
-  case 'y':
-    vim_change_state(vim_state, VIM_STATE_Default);
-    cmd.cmd = ED_RequestClipboardCopy;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    // Also, clear the selections.
-    cmd.cmd = ED_SelectionClearSelections;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'p':
-    vim_change_state(vim_state, VIM_STATE_Default);
-    cmd.cmd = ED_RequestClipboardPaste;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  case 'P':
-    vim_change_state(vim_state, VIM_STATE_Default);
-    cmd.cmd = ED_RequestClipboardPasteBeforeCursor;
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    break;
-  // Visual mode engage!
-  case 'v':
-    vim_change_state(vim_state, VIM_STATE_Visual);
-    break;
-  case 'V':
-    vim_state->visual_line_mode = 1;
-    break;
-  case 'z':
-    if (prev_sub_cmd == VIM_SUBCMD_z) {
-      cmd.cmd = ED_NavCenterCameraCursor;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-    } else {
-      vim_state->sub_cmd = VIM_SUBCMD_z;
-    }
-    break;
-}
-
+  }
+    
   flush_vim_cmd_list(ctx, vim_state, &cmd_lst);
   // Keep repeats active if we're processing a subcommand or we processed a repeat.
   vim_state->repeat = vim_state->repeat *
@@ -478,459 +626,555 @@ void vim_process_cmd(EditorCtx* ctx, VimProcessorState* vim_state, char c) {
   vim_state->sub_cmd = VIM_SUBCMD_None;
 
   uint64_t cursor_offset = 0;
-
-  // Process subcommands which take priority.
-  if (prev_sub_cmd == VIM_SUBCMD_r) {
-    cmd.cmd = ED_InsReplace;
-    cmd.buf = str8(&c, 1);
-    push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-  }
-  else {
-    // Command processing.
-    switch (c) {
-    // Capture repeats.
-    case '1':
-    case '2':
-    case '3':
-    case '4':
-    case '5':
-    case '6':
-    case '7':
-    case '8':
-    case '9':
-      vim_state->repeat *= 10;
-      vim_state->repeat += (c - '0');
-      // Preserve whatever command we were processing.
-      vim_state->sub_cmd = prev_sub_cmd;
-      captured_repeat = 1;
-      break;
-    // Movement.
-    case 'h':
-      cmd.cmd = ED_NavLeft;
+  uint64_t pos_offset = 0;
+  switch (prev_sub_cmd) {
+    case VIM_SUBCMD_r:
+      cmd.cmd = ED_InsReplace;
+      cmd.buf = str8(&c, 1);
       push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
       break;
-    case 'j':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        // Since we're moving down we want to delete this line and delete a line again.
-        // Suppress the first one so the undo groups them.
-        cmd.cmd = ED_DelDeleteLine;
-        cmd.flags = ED_FLG_SuppressHistory;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_SuppressHistory);
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavLineDown;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case 'k':
-      cmd.cmd = ED_NavLineUp;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'l':
-      cmd.cmd = ED_NavRight;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'H':
+    case VIM_SUBCMD_t:
+      pos_offset = -1;
+    case VIM_SUBCMD_f:
       {
-        // Make the camera recenter.
-        cmd.flags |= ED_FLG_ResetCamera;
-        cmd.cmd = ED_NavCursorTopScreen;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        String8 search_string = str8(&c, 1);
+        EditorCursorArray cursors = {0};
+        ed_cursor_ranges(scratch.arena, ctx, &cursors);
+        uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+        
+        for EachIndex(i, cursors.size) {
+          cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, true) + pos_offset;
+        }
+        move_to(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size);
       }
-      break;
-    case 'L':
+      break; 
+    case VIM_SUBCMD_T:
+      pos_offset = 1;
+    case VIM_SUBCMD_F:
       {
-        // Make the camera recenter.
-        cmd.flags |= ED_FLG_ResetCamera;
-        cmd.cmd = ED_NavCursorBottomScreen;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        String8 search_string = str8(&c, 1);
+        EditorCursorArray cursors = {0};
+        ed_cursor_ranges(scratch.arena, ctx, &cursors);
+        uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+        
+        for EachIndex(i, cursors.size) {
+          cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, false) + pos_offset;
+        }
+        move_to(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size);
       }
       break;
-    case 'M':
+    case VIM_SUBCMD_df:
+      pos_offset = 1;
+    case VIM_SUBCMD_dt: 
       {
-        // Make the camera recenter.
-        cmd.flags |= ED_FLG_ResetCamera;
-        cmd.cmd = ED_NavCursorCenterScreen;
+        String8 search_string = str8(&c, 1);
+        EditorCursorArray cursors = {0};
+        ed_cursor_ranges(scratch.arena, ctx, &cursors);
+        uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+        
+        for EachIndex(i, cursors.size) {
+          cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, true) + pos_offset;
+        }
+        move_to_selection(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size); 
+        cmd.cmd = ED_RequestClipboardCut;
         push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case '0':
-      // Process repeats first.
-      if (vim_state->repeat != 0) {
-        vim_state->repeat *= 10;
-        // Preserve whatever command we were processing.
-        vim_state->sub_cmd = prev_sub_cmd;
-        captured_repeat = 1;
-      }
-      else if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_NavBeginningOfLine;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Now we can delete the selection.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavBeginningOfLine;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case '^':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_NavFirstNonemptyOfLine;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Now we can delete the selection.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavFirstNonemptyOfLine;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case '_':
-      if (vim_state->repeat > 0)
-      {
-        vim_state->repeat -= 1;
-        cmd.cmd = ED_NavLineDown;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        captured_repeat = 1;
-      }
-
-      cmd.cmd = ED_NavFirstNonemptyOfLine;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case '$':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_NavEndOfLine;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Now we can delete the selection.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else if (prev_sub_cmd == VIM_SUBCMD_c) {
-        cmd.cmd = ED_NavEndOfLine;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Now delete it.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Pull into insert.
-        vim_change_state(vim_state, VIM_STATE_Insert);
-      }
-      else {
-        cmd.cmd = ED_NavEndOfLine;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case 'G':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_NavContentEnd;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Now we can delete the selection.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavContentEnd;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case 'g':
-      if (prev_sub_cmd == VIM_SUBCMD_g) {
-        cmd.cmd = ED_NavContentBeginning;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else if (prev_sub_cmd == VIM_SUBCMD_dg) {
-        cmd.cmd = ED_NavContentBeginning;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Now we can delete the selection.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else if (prev_sub_cmd == VIM_SUBCMD_d) {
-        vim_state->sub_cmd = VIM_SUBCMD_dg;
-      }
-      else {
-        vim_state->sub_cmd = VIM_SUBCMD_g;
-      }
-      break;
-    case '%':
-      cmd.cmd = ED_NavMatchingEncloser;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'e': // FIXME: find correct behavior for 'e'.
-    case 'w':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_DelDeleteWord;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else if (prev_sub_cmd == VIM_SUBCMD_c) {
-        cmd.cmd = ED_DelDeleteWord;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        vim_change_state(vim_state, VIM_STATE_Insert);
-      }
-      else if (prev_sub_cmd == VIM_SUBCMD_ci) {
-        cmd.cmd = ED_NavWordStart;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Then select the end of the word.
-        cmd.cmd = ED_NavWordEnd;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Delete.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        vim_change_state(vim_state, VIM_STATE_Insert);
-      }
-      else {
-        cmd.cmd = ED_NavWordRight;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case 'E': // FIXME: find correct behavior for 'E'.
-    case 'W':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_DelDeleteChunk;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavChunkRight;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case 'b':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_DelBackspaceWord;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavWordLeft;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case 'B':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_DelBackspaceChunk;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        cmd.cmd = ED_NavChunkLeft;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    case '}':
-      cmd.cmd = ED_NavEmptyBlockDown;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case '{':
-      cmd.cmd = ED_NavEmptyBlockUp;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case ':':
-      cmd.cmd = ED_NavRequestGotoLine;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    // Insertion-like behavior.
-    case 'i':
-      if (prev_sub_cmd == VIM_SUBCMD_c) {
-        vim_state->sub_cmd = VIM_SUBCMD_ci;
-      }
-      else {
-        vim_change_state(vim_state, VIM_STATE_Insert);
-      }
-      break;
-    case 'I':
-      vim_change_state(vim_state, VIM_STATE_Insert);
-      cmd.cmd = ED_NavFirstNonemptyOfLine;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'o':
-      vim_change_state(vim_state, VIM_STATE_Insert);
-      cmd.cmd = ED_InsOpenLineBelow;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'O':
-      vim_change_state(vim_state, VIM_STATE_Insert);
-      cmd.cmd = ED_InsOpenLineAbove;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'a':
-      vim_change_state(vim_state, VIM_STATE_Insert);
-      cmd.cmd = ED_NavRightNoNLAdvance;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'A':
-      vim_change_state(vim_state, VIM_STATE_Insert);
-      cmd.cmd = ED_NavEndOfLine;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'R':
-      vim_change_state(vim_state, VIM_STATE_Replace);
-      break;
-    // Editing shortcuts.
-    case 'u': // Redo will share the original shortcut.
-      cmd.cmd = ED_URTryUndo;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'd':
-      if (prev_sub_cmd == VIM_SUBCMD_d) {
-        cmd.cmd = ED_RequestClipboardCopy;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        cmd.cmd = ED_DelDeleteLine;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        vim_state->sub_cmd = VIM_SUBCMD_d;
-      }
-      break;
-    case 'x':
-      // Highlight the char in front.
-      cmd.flags |= ED_FLG_UpdateSelection;
-      cmd.cmd = ED_NavRight;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      // Cut it out.
-      cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-      cmd.cmd = ED_RequestClipboardCut;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'D':
-      cmd.cmd = ED_NavEndOfLine;
-      cmd.flags |= ED_FLG_UpdateSelection;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      // Now delete it.
-      cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-      cmd.cmd = ED_DelDeleteChar;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'C':
-      cmd.cmd = ED_NavEndOfLine;
-      cmd.flags |= ED_FLG_UpdateSelection;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      // Now delete it.
-      cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-      cmd.cmd = ED_DelDeleteChar;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      // Pull into insert.
-      vim_change_state(vim_state, VIM_STATE_Insert);
-      break;
-    case 'c':
-      if (prev_sub_cmd == VIM_SUBCMD_c) {
-        cmd.cmd = ED_NavBeginningOfLine;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Select entire line content.
-        cmd.cmd = ED_NavEndOfLine;
-        cmd.flags |= ED_FLG_UpdateSelection;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Delete it.
-        cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
-        cmd.cmd = ED_DelDeleteChar;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        // Pull back to insert mode.
-        vim_change_state(vim_state, VIM_STATE_Insert);
-      }
-      else {
-        vim_state->sub_cmd = VIM_SUBCMD_c;
-      }
-      break;
-    case 'J':
-      // TODO: multi-cursor.
-      cmd.cmd = ED_SpecJoinLineBelow;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'r':
-      vim_state->sub_cmd = VIM_SUBCMD_r;
-      break;
-    // Search.
-    case '/':
-      cmd.cmd = ED_FindRequestFind;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case '*':
-      cmd.cmd = ED_FindRequestFindWithSeed;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    // Yank/Paste.
-    case 'y':
-      if (prev_sub_cmd == VIM_SUBCMD_y) {
-        cmd.cmd = ED_RequestClipboardCopy;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      else {
-        vim_state->sub_cmd = VIM_SUBCMD_y;
-      }
-      break;
-    case 'p':
-      cmd.cmd = ED_RequestClipboardPaste;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    case 'P':
-      cmd.cmd = ED_RequestClipboardPasteBeforeCursor;
-      push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      break;
-    // Visual mode engage!
-    case 'v':
-      vim_change_state(vim_state, VIM_STATE_Visual);
-      if (!current_cursor_offset(scratch.arena, ctx, &cursor_offset))
-      {
-        String8 msg = str8_lit("Multiple cursors are not supported in VISUAL mode!");
-        feed_queue_warning(msg);
         break;
       }
-      vim_state->visual_line_mode_origin_offset = cursor_offset;
-      break;
-    case 'V':
-      if (!current_cursor_offset(scratch.arena, ctx, &cursor_offset))
+    case VIM_SUBCMD_yf:
+      pos_offset = 1;
+    case VIM_SUBCMD_yt:
       {
-        String8 msg = str8_lit("Multiple cursors are not supported in VISUAL LINE mode!");
-        feed_queue_warning(msg);
-        break;
+        String8 search_string = str8(&c, 1);
+        EditorCursorArray cursors = {0};
+        EditorCursorArray cursors_base = {0};
+        ed_cursor_ranges(scratch.arena, ctx, &cursors);
+        ed_cursor_ranges(scratch.arena, ctx, &cursors_base);
+        uint64_t* cursor_positions = push_array_no_zero(scratch.arena, uint64_t, cursors.size);
+        uint64_t* cursor_base_positions = push_array_no_zero(scratch.arena, uint64_t, cursors_base.size);
+        
+        for EachIndex(i, cursors_base.size) {
+          cursor_base_positions[i] = cursors_base.array[i].cursor_off;
+        }
+        
+        for EachIndex(i, cursors.size) {
+          cursor_positions[i] = search_in_line(scratch.arena, ctx, cursors.array[i].cursor_off, search_string, true) + pos_offset;
+        }
+        move_to_selection(scratch.arena, &cmd_lst, &cmd, cursor_positions, cursors.size); 
+        cmd.cmd = ED_RequestClipboardCopy;
+        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+        move_to(scratch.arena, &cmd_lst, &cmd, cursor_base_positions, cursors.size); 
       }
+      break;
+    default:
+      switch (c) {
+        // Capture repeats.
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+          vim_state->repeat *= 10;
+          vim_state->repeat += (c - '0');
+          // Preserve whatever command we were processing.
+          vim_state->sub_cmd = prev_sub_cmd;
+          captured_repeat = 1;
+          break;
+          // Movement.
+        case 'h':
+          cmd.cmd = ED_NavLeft;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'j':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            // Since we're moving down we want to delete this line and delete a line again.
+            // Suppress the first one so the undo groups them.
+            cmd.cmd = ED_DelDeleteLine;
+            cmd.flags = ED_FLG_SuppressHistory;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_SuppressHistory);
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavLineDown;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'k':
+          cmd.cmd = ED_NavLineUp;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'l':
+          cmd.cmd = ED_NavRight;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'H':
+          {
+            // Make the camera recenter.
+            cmd.flags |= ED_FLG_ResetCamera;
+            cmd.cmd = ED_NavCursorTopScreen;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'L':
+          {
+            // Make the camera recenter.
+            cmd.flags |= ED_FLG_ResetCamera;
+            cmd.cmd = ED_NavCursorBottomScreen;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'M':
+          {
+            // Make the camera recenter.
+            cmd.flags |= ED_FLG_ResetCamera;
+            cmd.cmd = ED_NavCursorCenterScreen;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case '0':
+          // Process repeats first.
+          if (vim_state->repeat != 0) {
+            vim_state->repeat *= 10;
+            // Preserve whatever command we were processing.
+            vim_state->sub_cmd = prev_sub_cmd;
+            captured_repeat = 1;
+          }
+          else if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_NavBeginningOfLine;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Now we can delete the selection.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavBeginningOfLine;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case '^':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_NavFirstNonemptyOfLine;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Now we can delete the selection.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavFirstNonemptyOfLine;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case '_':
+          if (vim_state->repeat > 0)
+          {
+            vim_state->repeat -= 1;
+            cmd.cmd = ED_NavLineDown;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            captured_repeat = 1;
+          }
 
-      vim_change_state(vim_state, VIM_STATE_Visual);
-      vim_state->visual_line_mode = 1;
-      vim_state->visual_line_mode_origin_offset = cursor_offset;
+          cmd.cmd = ED_NavFirstNonemptyOfLine;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case '$':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_NavEndOfLine;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Now we can delete the selection.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else if (prev_sub_cmd == VIM_SUBCMD_c) {
+            cmd.cmd = ED_NavEndOfLine;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Now delete it.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Pull into insert.
+            vim_change_state(vim_state, VIM_STATE_Insert);
+          }
+          else {
+            cmd.cmd = ED_NavEndOfLine;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'G':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_NavContentEnd;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Now we can delete the selection.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavContentEnd;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'g':
+          if (prev_sub_cmd == VIM_SUBCMD_g) {
+            cmd.cmd = ED_NavContentBeginning;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else if (prev_sub_cmd == VIM_SUBCMD_dg) {
+            cmd.cmd = ED_NavContentBeginning;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Now we can delete the selection.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else if (prev_sub_cmd == VIM_SUBCMD_d) {
+            vim_state->sub_cmd = VIM_SUBCMD_dg;
+          }
+          else {
+            vim_state->sub_cmd = VIM_SUBCMD_g;
+          }
+          break;
+        case '%':
+          cmd.cmd = ED_NavMatchingEncloser;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'e': // FIXME: find correct behavior for 'e'.
+        case 'w':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_DelDeleteWord;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else if (prev_sub_cmd == VIM_SUBCMD_c) {
+            cmd.cmd = ED_DelDeleteWord;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            vim_change_state(vim_state, VIM_STATE_Insert);
+          }
+          else if (prev_sub_cmd == VIM_SUBCMD_ci) {
+            cmd.cmd = ED_NavWordStart;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Then select the end of the word.
+            cmd.cmd = ED_NavWordEnd;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Delete.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            vim_change_state(vim_state, VIM_STATE_Insert);
+          }
+          else {
+            cmd.cmd = ED_NavWordRight;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'E': // FIXME: find correct behavior for 'E'.
+        case 'W':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_DelDeleteChunk;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavChunkRight;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'b':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_DelBackspaceWord;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavWordLeft;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'B':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_DelBackspaceChunk;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            cmd.cmd = ED_NavChunkLeft;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case '}':
+          cmd.cmd = ED_NavEmptyBlockDown;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case '{':
+          cmd.cmd = ED_NavEmptyBlockUp;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case ':':
+          cmd.cmd = ED_NavRequestGotoLine;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+          // Insertion-like behavior.
+        case 'i':
+          if (prev_sub_cmd == VIM_SUBCMD_c) {
+            vim_state->sub_cmd = VIM_SUBCMD_ci;
+          }
+          else {
+            vim_change_state(vim_state, VIM_STATE_Insert);
+          }
+          break;
+        case 'I':
+          vim_change_state(vim_state, VIM_STATE_Insert);
+          cmd.cmd = ED_NavFirstNonemptyOfLine;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'o':
+          vim_change_state(vim_state, VIM_STATE_Insert);
+          cmd.cmd = ED_InsOpenLineBelow;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'O':
+          vim_change_state(vim_state, VIM_STATE_Insert);
+          cmd.cmd = ED_InsOpenLineAbove;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'a':
+          vim_change_state(vim_state, VIM_STATE_Insert);
+          cmd.cmd = ED_NavRightNoNLAdvance;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'A':
+          vim_change_state(vim_state, VIM_STATE_Insert);
+          cmd.cmd = ED_NavEndOfLine;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'R':
+          vim_change_state(vim_state, VIM_STATE_Replace);
+          break;
+          // Editing shortcuts.
+        case 'u': // Redo will share the original shortcut.
+          cmd.cmd = ED_URTryUndo;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'd':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            cmd.cmd = ED_RequestClipboardCopy;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            cmd.cmd = ED_DelDeleteLine;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            vim_state->sub_cmd = VIM_SUBCMD_d;
+          }
+          break;
+        case 'x':
+          // Highlight the char in front.
+          cmd.flags |= ED_FLG_UpdateSelection;
+          cmd.cmd = ED_NavRight;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          // Cut it out.
+          cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+          cmd.cmd = ED_RequestClipboardCut;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'D':
+          cmd.cmd = ED_NavEndOfLine;
+          cmd.flags |= ED_FLG_UpdateSelection;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          // Now delete it.
+          cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+          cmd.cmd = ED_DelDeleteChar;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'C':
+          cmd.cmd = ED_NavEndOfLine;
+          cmd.flags |= ED_FLG_UpdateSelection;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          // Now delete it.
+          cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+          cmd.cmd = ED_DelDeleteChar;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          // Pull into insert.
+          vim_change_state(vim_state, VIM_STATE_Insert);
+          break;
+        case 'c':
+          if (prev_sub_cmd == VIM_SUBCMD_c) {
+            cmd.cmd = ED_NavBeginningOfLine;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Select entire line content.
+            cmd.cmd = ED_NavEndOfLine;
+            cmd.flags |= ED_FLG_UpdateSelection;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Delete it.
+            cmd.flags = ed_flag_remove(cmd.flags, ED_FLG_UpdateSelection);
+            cmd.cmd = ED_DelDeleteChar;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            // Pull back to insert mode.
+            vim_change_state(vim_state, VIM_STATE_Insert);
+          }
+          else {
+            vim_state->sub_cmd = VIM_SUBCMD_c;
+          }
+          break;
+        case 'J':
+          // TODO: multi-cursor.
+          cmd.cmd = ED_SpecJoinLineBelow;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'r':
+          vim_state->sub_cmd = VIM_SUBCMD_r;
+          break;
+          // Search.
+        case '/':
+          cmd.cmd = ED_FindRequestFind;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case '*':
+          cmd.cmd = ED_FindRequestFindWithSeed;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+          // Yank/Paste.
+        case 'y':
+          if (prev_sub_cmd == VIM_SUBCMD_y) {
+            cmd.cmd = ED_RequestClipboardCopy;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            vim_state->sub_cmd = VIM_SUBCMD_y;
+          }
+          break;
+        case 'p':
+          cmd.cmd = ED_RequestClipboardPaste;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+        case 'P':
+          cmd.cmd = ED_RequestClipboardPasteBeforeCursor;
+          push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          break;
+          // Visual mode engage!
+        case 'v':
+          vim_change_state(vim_state, VIM_STATE_Visual);
+          if (!current_cursor_offset(scratch.arena, ctx, &cursor_offset))
+          {
+            String8 msg = str8_lit("Multiple cursors are not supported in VISUAL mode!");
+            feed_queue_warning(msg);
+            break;
+          }
+          vim_state->visual_line_mode_origin_offset = cursor_offset;
+          break;
+        case 'V':
+          if (!current_cursor_offset(scratch.arena, ctx, &cursor_offset))
+          {
+            String8 msg = str8_lit("Multiple cursors are not supported in VISUAL LINE mode!");
+            feed_queue_warning(msg);
+            break;
+          }
 
-      break;
-    // Closing.
-    case 'Z':
-      if (prev_sub_cmd == VIM_SUBCMD_Z) {
-        cmd.cmd = ED_SaveRequestSave;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-        cmd.cmd = ED_CloseRequestClose;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          vim_change_state(vim_state, VIM_STATE_Visual);
+          vim_state->visual_line_mode = 1;
+          vim_state->visual_line_mode_origin_offset = cursor_offset;
+
+          break;
+          // Closing.
+        case 'Z':
+          if (prev_sub_cmd == VIM_SUBCMD_Z) {
+            cmd.cmd = ED_SaveRequestSave;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+            cmd.cmd = ED_CloseRequestClose;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          else {
+            vim_state->sub_cmd = VIM_SUBCMD_Z;
+          }
+          break;
+        case 'z':
+          if (prev_sub_cmd == VIM_SUBCMD_z) {
+            cmd.cmd = ED_NavCenterCameraCursor;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          } else {
+            vim_state->sub_cmd = VIM_SUBCMD_z;
+          }
+          break;
+        case 'Q':
+          if (prev_sub_cmd == VIM_SUBCMD_Z) {
+            cmd.cmd = ED_CloseRequestClose;
+            push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
+          }
+          break;
+        case 'f':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            vim_state->sub_cmd = VIM_SUBCMD_df;
+          } else if (prev_sub_cmd == VIM_SUBCMD_y) {
+            vim_state->sub_cmd = VIM_SUBCMD_yf;
+          }else {
+            vim_state->sub_cmd = VIM_SUBCMD_f;
+          }
+          break;
+        case 'F':
+          vim_state->sub_cmd = VIM_SUBCMD_F;
+          break;
+        case 't':
+          if (prev_sub_cmd == VIM_SUBCMD_d) {
+            vim_state->sub_cmd = VIM_SUBCMD_dt;
+          } else if (prev_sub_cmd == VIM_SUBCMD_y) {
+            vim_state->sub_cmd = VIM_SUBCMD_yt;
+          }else {
+            vim_state->sub_cmd = VIM_SUBCMD_t;
+          }
+          break;
+        case 'T':
+          vim_state->sub_cmd = VIM_SUBCMD_T;
+          break;
       }
-      else {
-        vim_state->sub_cmd = VIM_SUBCMD_Z;
-      }
       break;
-    case 'z':
-      if (prev_sub_cmd == VIM_SUBCMD_z) {
-        cmd.cmd = ED_NavCenterCameraCursor;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      } else {
-        vim_state->sub_cmd = VIM_SUBCMD_z;
-      }
-      break;
-    case 'Q':
-      if (prev_sub_cmd == VIM_SUBCMD_Z) {
-        cmd.cmd = ED_CloseRequestClose;
-        push_vim_cmd_entry(scratch.arena, &cmd_lst, &cmd);
-      }
-      break;
-    }
   }
 
   flush_vim_cmd_list(ctx, vim_state, &cmd_lst);
